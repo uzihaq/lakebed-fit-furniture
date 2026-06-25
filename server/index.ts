@@ -19,7 +19,8 @@ export default capsule({
   },
   queries: {
     // queries take no args in Lakebed; everyone gets all rooms and the client
-    // selects the one matching the URL slug.
+    // selects the one matching the URL slug. (Splitting the floor-plan blob into its own
+    // query does NOT help: Lakebed re-ships every subscribed query in full on every write.)
     rooms: query((ctx) => ctx.db.rooms.all()),
   },
   mutations: {

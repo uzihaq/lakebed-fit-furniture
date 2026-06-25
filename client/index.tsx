@@ -61,11 +61,11 @@ const CATALOG: { g: string; items: Preset[] }[] = [
 function parseToInches(input: string): number | null {
   const s = String(input).trim().toLowerCase();
   let m = s.match(/(\d+\.?\d*)\s*['′]\s*-?\s*(\d+\.?\d*)\s*["″]?/); if (m) return +m[1] * 12 + +m[2];
-  m = s.match(/(\d+\.?\d*)\s*['′]/); if (m) return +m[1] * 12;
-  m = s.match(/(\d+\.?\d*)\s*(?:"|″|in)/); if (m) return +m[1];
+  m = s.match(/(\d+\.?\d*)\s*(?:'|′|ft|foot|feet)/); if (m) return +m[1] * 12;
+  m = s.match(/(\d+\.?\d*)\s*(?:"|″|in|inch|inches)/); if (m) return +m[1];
   m = s.match(/(\d+\.?\d*)\s*m(?:eters?)?(?!\w)/); if (m) return +m[1] * 39.3701;
   m = s.match(/(\d+\.?\d*)\s*cm/); if (m) return +m[1] / 2.54;
-  m = s.match(/^(\d+\.?\d*)$/); if (m) return +m[1] * 12; // bare number = feet
+  m = s.match(/^(\d+\.?\d*)\s*$/); if (m) return +m[1] * 12; // bare number = feet
   return null;
 }
 const fmtFt = (inches: number) => { const t = Math.round(inches); const ft = Math.floor(t / 12); const r = t % 12; return r ? `${ft}'${r}"` : `${ft}'`; };
@@ -157,15 +157,23 @@ async function imageToPlan(blob: Blob): Promise<string> {
   const url = URL.createObjectURL(blob);
   try {
     const img = await new Promise<HTMLImageElement>((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = url; });
-    const max = 400;
-    const scale = Math.min(1, max / Math.max(img.width, img.height));
-    const w = Math.max(1, Math.round(img.width * scale)), h = Math.max(1, Math.round(img.height * scale));
-    const cv = document.createElement("canvas"); cv.width = w; cv.height = h;
-    const ctx = cv.getContext("2d")!; ctx.drawImage(img, 0, 0, w, h);
-    const d = ctx.getImageData(0, 0, w, h);
-    for (let i = 0; i < d.data.length; i += 4) { const g = (d.data[i] * 0.3 + d.data[i + 1] * 0.59 + d.data[i + 2] * 0.11) | 0; d.data[i] = d.data[i + 1] = d.data[i + 2] = g; }
-    ctx.putImageData(d, 0, 0);
-    return cv.toDataURL("image/jpeg", 0.4);
+    const LIMIT = 62000; // base64 budget — Lakebed caps a stored value at ~64KB (no file storage)
+    const render = (maxDim: number, q: number): string => {
+      const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+      const w = Math.max(1, Math.round(img.width * scale)), h = Math.max(1, Math.round(img.height * scale));
+      const cv = document.createElement("canvas"); cv.width = w; cv.height = h;
+      const ctx = cv.getContext("2d")!;
+      ctx.imageSmoothingEnabled = true; (ctx as any).imageSmoothingQuality = "high";
+      ctx.drawImage(img, 0, 0, w, h);
+      const d = ctx.getImageData(0, 0, w, h);
+      for (let i = 0; i < d.data.length; i += 4) { let g = (d.data[i] * 0.3 + d.data[i + 1] * 0.59 + d.data[i + 2] * 0.11) | 0; g = Math.min(255, Math.round(g / 17) * 17); /* 16 gray levels, white stays white */ d.data[i] = d.data[i + 1] = d.data[i + 2] = g; }
+      ctx.putImageData(d, 0, 0);
+      return cv.toDataURL("image/jpeg", q);
+    };
+    // use as much resolution as fits — pick the sharpest that stays under the cap
+    const tries: [number, number][] = [[1200, 0.72], [1040, 0.7], [900, 0.68], [780, 0.64], [660, 0.58], [560, 0.5], [460, 0.42], [380, 0.36]];
+    for (const [m, q] of tries) { const out = render(m, q); if (out.length <= LIMIT) return out; }
+    return render(320, 0.32);
   } finally { URL.revokeObjectURL(url); }
 }
 
@@ -213,17 +221,31 @@ export function App() {
 
   const [slug] = useState(slugFromHash);
   const room = useMemo(() => rooms.find((r) => r.slug === slug), [rooms, slug]);
+  const floorPlan = room?.floorPlan || "";
   const serverItems: Item[] = useMemo(() => { try { return JSON.parse(room?.items || "[]"); } catch { return []; } }, [room?.items]);
   const ppi = Number(room?.ppi) > 0 ? Number(room!.ppi) : 1.6;
 
   const [sel, setSel] = useState<string | null>(null);
   const [drag, setDrag] = useState<{ id: string; sx: number; sy: number; x: number; y: number; active: boolean } | null>(null);
-  const [rotating, setRotating] = useState<{ id: string; rotation: number; cx: number; cy: number; start: number; base: number } | null>(null);
+  const [rotating, setRotating] = useState<{ id: string; rotation: number; cx: number; cy: number; start: number; base: number; snap: number } | null>(null);
   const [calib, setCalib] = useState<{ a?: { x: number; y: number }; b?: { x: number; y: number } } | null>(null);
+  const [calibLen, setCalibLen] = useState("10'");
+  const [zoom, setZoom] = useState(1);
   const [toast, setToast] = useState("");
   const [isMobile, setIsMobile] = useState(() => typeof window !== "undefined" && window.innerWidth < 760);
   const [panelOpen, setPanelOpen] = useState(false);
+  const [opt, setOpt] = useState<Record<string, { x?: number; y?: number; rotation?: number }>>({});
+  const [gridOn, setGridOn] = useState(true);
   const canvasRef = useRef<HTMLDivElement>(null);
+  const mainRef = useRef<HTMLDivElement>(null);
+  // the floor plan + furniture share ONE fixed "document" sized to the plan image, so they're locked
+  // together; the document is then scaled to FIT the viewport. on resize the whole thing rescales as a
+  // unit, instead of the plan re-fitting on its own and sliding out from under the furniture.
+  const [planDims, setPlanDims] = useState({ w: 1200, h: 850 });
+  const [vp, setVp] = useState(() => ({ w: typeof window !== "undefined" ? window.innerWidth : 1200, h: typeof window !== "undefined" ? window.innerHeight : 800 }));
+  const fit = Math.min(vp.w / planDims.w, vp.h / planDims.h) || 1;
+  const scale = fit * zoom;                            // total on-screen scale of the document
+  const scaleRef = useRef(1); scaleRef.current = scale;
 
   useEffect(() => { ensureRoom(slug); }, [slug]);
 
@@ -234,9 +256,26 @@ export function App() {
     return () => window.removeEventListener("resize", onResize);
   }, []);
 
+  // measure the canvas viewport so the document can be fit-scaled into it (re-runs on any resize)
+  useEffect(() => {
+    const el = mainRef.current; if (!el) return;
+    const update = () => setVp({ w: el.clientWidth, h: el.clientHeight });
+    update();
+    const ro = new ResizeObserver(update); ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  // the document is the size of the floor-plan image, so furniture coordinates are plan-relative
+  useEffect(() => {
+    if (!floorPlan) return;
+    const img = new Image();
+    img.onload = () => { if (img.naturalWidth && img.naturalHeight) setPlanDims({ w: img.naturalWidth, h: img.naturalHeight }); };
+    img.src = floorPlan;
+  }, [floorPlan]);
+
   // favicon + title (Lakebed owns the HTML shell; inject from the client)
   useEffect(() => {
-    const href = "data:image/svg+xml," + encodeURIComponent(`<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='#0e0e13'/><rect x='6' y='6' width='20' height='20' rx='5' fill='url(#g)'/><defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop stop-color='#4ecdc4'/><stop offset='1' stop-color='#2a6b66'/></linearGradient></defs></svg>`);
+    const href = "data:image/svg+xml," + encodeURIComponent(`<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='#0e0e13'/><g transform='translate(4 4)' fill='none' stroke='#4ecdc4' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M20 9V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v3'/><path d='M2 11v5a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-5a2 2 0 0 0-4 0v1H6v-1a2 2 0 0 0-4 0z'/><path d='M4 18v2'/><path d='M20 18v2'/></g></svg>`);
     let link = document.querySelector("link[rel='icon']") as HTMLLinkElement | null;
     if (!link) { link = document.createElement("link"); link.rel = "icon"; document.head.appendChild(link); }
     link.type = "image/svg+xml"; link.href = href;
@@ -267,10 +306,13 @@ export function App() {
     const onMove = (e: PointerEvent) => {
       if (e.pointerType === "mouse" && e.buttons === 0) return; // ignore stray moves after release
       const r = cv.getBoundingClientRect();
-      const x = e.clientX - r.left, y = e.clientY - r.top;
+      const x = (e.clientX - r.left) / scaleRef.current, y = (e.clientY - r.top) / scaleRef.current;
       setDrag((d) => d && ({ ...d, x, y, active: d.active || Math.hypot(x - d.sx, y - d.sy) > 4 }));
     };
-    const onUp = () => { setDrag((d) => { if (d && d.active) moveItemM(JSON.stringify({ slug, id: d.id, x: Math.round(d.x), y: Math.round(d.y) })); return null; }); };
+    const onUp = () => {
+      if (drag && drag.active) { const X = Math.round(drag.x), Y = Math.round(drag.y); setOpt((o) => ({ ...o, [drag.id]: { ...o[drag.id], x: X, y: Y } })); moveItemM(JSON.stringify({ slug, id: drag.id, x: X, y: Y })); }
+      setDrag(null);
+    };
     window.addEventListener("pointermove", onMove); window.addEventListener("pointerup", onUp);
     return () => { window.removeEventListener("pointermove", onMove); window.removeEventListener("pointerup", onUp); };
   }, [drag, slug]);
@@ -282,20 +324,42 @@ export function App() {
       if (e.pointerType === "mouse" && e.buttons === 0) return;
       const ang = Math.atan2(e.clientY - rotating.cy, e.clientX - rotating.cx);
       let deg = rotating.base + (ang - rotating.start) * 180 / Math.PI;
-      deg = Math.round(deg / 3) * 3;
+      deg = Math.round(deg / rotating.snap) * rotating.snap;
       setRotating((s) => s && ({ ...s, rotation: ((deg % 360) + 360) % 360 }));
     };
-    const onUp = () => { setRotating((s) => { if (s) patchItemM(JSON.stringify({ slug, id: s.id, patch: { rotation: s.rotation } })); return null; }); };
+    const onUp = () => {
+      if (rotating) { setOpt((o) => ({ ...o, [rotating.id]: { ...o[rotating.id], rotation: rotating.rotation } })); patchItemM(JSON.stringify({ slug, id: rotating.id, patch: { rotation: rotating.rotation } })); }
+      setRotating(null);
+    };
     window.addEventListener("pointermove", onMove); window.addEventListener("pointerup", onUp);
     return () => { window.removeEventListener("pointermove", onMove); window.removeEventListener("pointerup", onUp); };
   }, [rotating, slug]);
 
-  const display = drag?.active ? serverItems.map((it) => (it.id === drag.id ? { ...it, x: drag.x, y: drag.y } : it)) : serverItems;
+  const base = serverItems.map((it) => (opt[it.id] ? { ...it, ...opt[it.id] } : it));
+  const display = drag?.active ? base.map((it) => (it.id === drag.id ? { ...it, x: drag.x, y: drag.y } : it)) : base;
   const selItem = display.find((i) => i.id === sel) || null;
 
+  // optimistic edits (move/rotate) show instantly; drop each one once the server row catches up
+  useEffect(() => {
+    setOpt((o) => {
+      if (Object.keys(o).length === 0) return o;
+      const next: typeof o = {}; let changed = false;
+      for (const id in o) {
+        const it = serverItems.find((s) => s.id === id);
+        if (!it) { changed = true; continue; }
+        const ov = o[id]; const keep: any = {};
+        if (ov.x !== undefined && Math.round(ov.x) !== Math.round(it.x)) keep.x = ov.x;
+        if (ov.y !== undefined && Math.round(ov.y) !== Math.round(it.y)) keep.y = ov.y;
+        if (ov.rotation !== undefined && ov.rotation !== it.rotation) keep.rotation = ov.rotation;
+        if (Object.keys(keep).length) next[id] = keep;
+        if (Object.keys(keep).length !== Object.keys(ov).length) changed = true;
+      }
+      return changed ? next : o;
+    });
+  }, [serverItems]);
+
   function addPreset(p: Preset) {
-    const cv = canvasRef.current; const cx = cv ? cv.clientWidth / 2 : 300; const cy = cv ? cv.clientHeight / 2 : 250;
-    const item = presetToItem(p, TYPE_COLOR[p.type] || "#78716C", Math.round(cx), Math.round(cy));
+    const item = presetToItem(p, TYPE_COLOR[p.type] || "#78716C", Math.round(planDims.w / 2), Math.round(planDims.h / 2));
     addItemM(JSON.stringify({ slug, item }));
     setSel(item.id);
   }
@@ -306,19 +370,25 @@ export function App() {
   }
   function onCanvasClick(e: any) {
     if (!calib) { if (e.target === canvasRef.current) setSel(null); return; }
-    const r = canvasRef.current!.getBoundingClientRect(); const p = { x: e.clientX - r.left, y: e.clientY - r.top };
+    if (calib.a && calib.b) return;  // both points placed — waiting for the length input
+    const r = canvasRef.current!.getBoundingClientRect(); const p = { x: (e.clientX - r.left) / scaleRef.current, y: (e.clientY - r.top) / scaleRef.current };
     if (!calib.a) setCalib({ a: p });
-    else if (!calib.b) {
-      const a = calib.a!; const px = Math.hypot(p.x - a.x, p.y - a.y);
-      const ans = window.prompt("Real length of that line? (e.g. 10ft, 120in, 3m)", "10ft");
-      const inches = ans ? parseToInches(ans) : null;
-      if (inches && inches > 0) { setPpiM(JSON.stringify({ slug, ppi: (px / inches).toFixed(3) })); setToast(`Scale set · 1 ft = ${Math.round((px / inches) * 12)} px`); setTimeout(() => setToast(""), 2500); }
-      setCalib(null);
-    }
+    else setCalib({ a: calib.a, b: p });
   }
-  function startDrag(it: Item) { return (e: any) => { e.stopPropagation(); setSel(it.id); const r = canvasRef.current!.getBoundingClientRect(); const x = e.clientX - r.left, y = e.clientY - r.top; setDrag({ id: it.id, sx: x, sy: y, x, y, active: false }); }; }
-  function startRotate(it: Item) { return (e: any) => { e.stopPropagation(); const r = canvasRef.current!.getBoundingClientRect(); const cx = r.left + it.x, cy = r.top + it.y; setRotating({ id: it.id, rotation: it.rotation, cx, cy, start: Math.atan2(e.clientY - cy, e.clientX - cx), base: it.rotation }); }; }
+  function applyScale() {
+    if (!calib?.a || !calib?.b) return;
+    const px = Math.hypot(calib.b.x - calib.a.x, calib.b.y - calib.a.y);
+    const inches = parseToInches(calibLen);
+    if (px > 0 && inches && inches > 0) {
+      setPpiM(JSON.stringify({ slug, ppi: (px / inches).toFixed(3) }));
+      setToast(`Scale set · 1 ft = ${Math.round((px / inches) * 12)} px`); setTimeout(() => setToast(""), 2500);
+    } else { setToast("Couldn't read that length — try e.g. 10ft, 120in, 3m"); setTimeout(() => setToast(""), 2800); }
+    setCalib(null);
+  }
+  function startDrag(it: Item) { return (e: any) => { e.stopPropagation(); setSel(it.id); const r = canvasRef.current!.getBoundingClientRect(); const x = (e.clientX - r.left) / scaleRef.current, y = (e.clientY - r.top) / scaleRef.current; setDrag({ id: it.id, sx: x, sy: y, x, y, active: false }); }; }
+  function startRotate(it: Item, snap: number) { return (e: any) => { e.stopPropagation(); const r = canvasRef.current!.getBoundingClientRect(); const cx = r.left + it.x * scaleRef.current, cy = r.top + it.y * scaleRef.current; setRotating({ id: it.id, rotation: it.rotation, cx, cy, start: Math.atan2(e.clientY - cy, e.clientX - cx), base: it.rotation, snap }); }; }
   function share() { navigator.clipboard?.writeText(window.location.href); setToast("Public link copied — anyone with it can open this room and edit together"); setTimeout(() => setToast(""), 3200); }
+  function clearPlan() { setFloorPlan(JSON.stringify({ slug, floorPlan: "" })); setToast("Floor plan cleared — paste a new one anytime"); setTimeout(() => setToast(""), 1800); }
 
   const btn = (extra?: any) => ({ background: T.hover, color: T.text, border: `1px solid ${T.border}`, borderRadius: 8, padding: "7px 12px", fontSize: 13, cursor: "pointer", whiteSpace: "nowrap", ...extra });
 
@@ -333,7 +403,12 @@ export function App() {
       {/* header */}
       <header style={{ display: "flex", alignItems: "center", gap: 10, padding: isMobile ? "9px 12px" : "10px 16px", borderBottom: `1px solid ${T.border}`, background: T.bgDeep, flexShrink: 0, zIndex: 70 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <div style={{ width: 22, height: 22, borderRadius: 6, background: `linear-gradient(135deg, ${T.accent}, #2a6b66)`, boxShadow: "0 2px 8px -2px rgba(78,205,196,0.6)" }} />
+          <svg width={24} height={24} viewBox="0 0 24 24" fill="none" stroke={T.accent} strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+            <path d="M20 9V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v3" />
+            <path d="M2 11v5a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-5a2 2 0 0 0-4 0v1H6v-1a2 2 0 0 0-4 0z" />
+            <path d="M4 18v2" />
+            <path d="M20 18v2" />
+          </svg>
           {!isMobile && <strong style={{ fontSize: 16, letterSpacing: "-0.02em" }}>Fit</strong>}
         </div>
         <input
@@ -347,6 +422,7 @@ export function App() {
           {!isMobile && <span style={{ color: room?.ppi ? T.accent : T.textMuted, fontSize: 12, fontVariantNumeric: "tabular-nums", padding: "3px 9px", borderRadius: 20, background: T.hover, border: `1px solid ${T.border}`, whiteSpace: "nowrap" }}>
             {room?.ppi ? `1 ft = ${Math.round(ppi * 12)} px` : "scale not set"}
           </span>}
+          {floorPlan && <button class="fit-btn" style={btn()} onClick={clearPlan}>{isMobile ? "Clear" : "Clear plan"}</button>}
           <button class="fit-btn" style={btn()} onClick={() => setCalib(calib ? null : {})}>{calib ? (isMobile ? "Cancel" : "Cancel scale") : (isMobile ? "Scale" : "Set scale")}</button>
           <button class="fit-btn" style={btn({ background: T.accent, color: "#04201e", border: "none", fontWeight: 600 })} onClick={share}>Share</button>
           {isMobile
@@ -360,12 +436,14 @@ export function App() {
 
       <div style={{ display: "flex", flex: 1, minHeight: 0, position: "relative" }}>
         {/* canvas */}
-        <main style={{ flex: 1, position: "relative", overflow: "hidden", backgroundColor: T.bg, backgroundImage: `linear-gradient(rgba(255,255,255,0.025) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.025) 1px, transparent 1px)`, backgroundSize: "26px 26px" }}>
+        <main ref={mainRef} style={{ flex: 1, position: "relative", overflow: "hidden", backgroundColor: T.bg, backgroundImage: `linear-gradient(rgba(255,255,255,0.025) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.025) 1px, transparent 1px)`, backgroundSize: "26px 26px" }}>
           <div style={{ position: "absolute", inset: 0, background: "radial-gradient(circle at 50% 38%, transparent 40%, rgba(0,0,0,0.45))", pointerEvents: "none" }} />
+          {/* the fixed-size document (plan + furniture), fit-scaled into the viewport and centered */}
           <div ref={canvasRef} onClick={onCanvasClick}
-            style={{ position: "absolute", inset: 0, cursor: calib ? "crosshair" : "default" }}>
-            {room?.floorPlan && <img src={room.floorPlan} alt="floor plan" style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "contain", opacity: 0.85, pointerEvents: "none", filter: "contrast(1.1)" }} />}
-            {!room?.floorPlan && display.length === 0 &&
+            style={{ position: "absolute", left: "50%", top: "50%", width: planDims.w, height: planDims.h, transform: `translate(-50%,-50%) scale(${scale})`, transformOrigin: "center center", cursor: calib ? "crosshair" : "default" }}>
+            {floorPlan && <img src={floorPlan} alt="floor plan" style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "contain", opacity: 0.85, pointerEvents: "none", filter: "contrast(1.1)" }} />}
+            {gridOn && <div style={{ position: "absolute", inset: 0, pointerEvents: "none", backgroundImage: `linear-gradient(rgba(78,205,196,0.16) 1px, transparent 1px), linear-gradient(90deg, rgba(78,205,196,0.16) 1px, transparent 1px)`, backgroundSize: `${ppi * 12}px ${ppi * 12}px` }} />}
+            {!floorPlan && display.length === 0 &&
               <div class="fit-hint" style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", flexDirection: "column", gap: 10, color: T.textMuted, pointerEvents: "none" }}>
                 <div style={{ fontSize: 34, opacity: 0.55 }}>⌘V</div>
                 <div style={{ fontSize: 17, color: T.textSec }}>Paste a screenshot of your floor plan</div>
@@ -394,23 +472,34 @@ export function App() {
                       {fmtFt(it.w)}×{fmtFt(it.h)}
                     </span>
                   )}
-                  {isSel && !calib && CORNERS.map((pos, i) => (
-                    <div key={i} onPointerDown={startRotate(it)}
-                      style={{ position: "absolute", left: pos.l, top: pos.t, transform: "translate(-50%,-50%)", width: 13, height: 13, borderRadius: "50%", background: T.accent, border: "2px solid #fff", cursor: "grab", boxShadow: "0 2px 4px rgba(0,0,0,0.45)", zIndex: 40, touchAction: "none" }} />
+                  {isSel && !calib && (
+                    <>
+                      {/* pop-up rotation handle above the item (snaps to 15°) — works on touch too */}
+                      <div style={{ position: "absolute", left: "50%", top: -26, width: 2, height: 26, background: T.accent, transform: "translateX(-50%)", pointerEvents: "none", zIndex: 40 }} />
+                      <div onPointerDown={startRotate(it, 15)} title="Drag to rotate"
+                        style={{ position: "absolute", left: "50%", top: -34, transform: "translate(-50%,-50%)", width: 16, height: 16, borderRadius: "50%", background: T.accent, border: "2px solid #fff", cursor: "grab", boxShadow: "0 2px 5px rgba(0,0,0,0.45)", zIndex: 41, touchAction: "none" }} />
+                    </>
+                  )}
+                  {/* corner handles give precise (1°) rotation on desktop */}
+                  {isSel && !calib && !isMobile && CORNERS.map((pos, i) => (
+                    <div key={i} onPointerDown={startRotate(it, 1)}
+                      style={{ position: "absolute", left: pos.l, top: pos.t, transform: "translate(-50%,-50%)", width: 13, height: 13, borderRadius: "50%", background: "#fff", border: `2px solid ${T.accent}`, cursor: "grab", boxShadow: "0 2px 4px rgba(0,0,0,0.45)", zIndex: 40, touchAction: "none" }} />
                   ))}
                 </div>
               );
             })}
 
+            {calib?.a && calib?.b && <svg style={{ position: "absolute", inset: 0, width: "100%", height: "100%", pointerEvents: "none" }}><line x1={calib.a.x} y1={calib.a.y} x2={calib.b.x} y2={calib.b.y} stroke={T.accent} strokeWidth={2} strokeDasharray="6 4" /></svg>}
             {calib?.a && <div style={{ position: "absolute", left: calib.a.x - 5, top: calib.a.y - 5, width: 10, height: 10, borderRadius: "50%", background: T.accent, boxShadow: `0 0 0 4px rgba(78,205,196,0.25)` }} />}
+            {calib?.b && <div style={{ position: "absolute", left: calib.b.x - 5, top: calib.b.y - 5, width: 10, height: 10, borderRadius: "50%", background: T.accent, boxShadow: `0 0 0 4px rgba(78,205,196,0.25)` }} />}
           </div>
 
           {/* selected toolbar */}
           {selItem && !calib && (
             <div style={{ position: "absolute", bottom: 18, left: "50%", transform: "translateX(-50%)", display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", justifyContent: "center", maxWidth: "calc(100vw - 24px)", background: T.elevated, border: `1px solid ${T.borderLight}`, borderRadius: 14, padding: "8px 10px", boxShadow: "0 16px 40px -12px rgba(0,0,0,0.85)" }}>
               <span style={{ fontSize: 12, color: T.textSec, marginLeft: 2, marginRight: 2, whiteSpace: "nowrap" }}>{CATALOG.flatMap((g) => g.items).find((p) => p.id === selItem.preset)?.label ?? "Item"} · {fmtFt(selItem.w)}×{fmtFt(selItem.h)}</span>
-              <button class="fit-btn" style={btn({ padding: "6px 9px" })} title="Rotate left" onClick={() => patchItemM(JSON.stringify({ slug, id: selItem.id, patch: { rotation: (selItem.rotation - 15 + 360) % 360 } }))}>⟲</button>
-              <button class="fit-btn" style={btn({ padding: "6px 9px" })} title="Rotate right" onClick={() => patchItemM(JSON.stringify({ slug, id: selItem.id, patch: { rotation: (selItem.rotation + 15) % 360 } }))}>⟳</button>
+              <button class="fit-btn" style={btn({ padding: "7px 11px", color: T.accent, fontSize: 15 })} title="Rotate left 90°" onClick={() => { const nr = (selItem.rotation - 90 + 360) % 360; setOpt((o) => ({ ...o, [selItem.id]: { ...o[selItem.id], rotation: nr } })); patchItemM(JSON.stringify({ slug, id: selItem.id, patch: { rotation: nr } })); }}>⟲</button>
+              <button class="fit-btn" style={btn({ padding: "7px 11px", color: T.accent, fontSize: 15 })} title="Rotate right 90°" onClick={() => { const nr = (selItem.rotation + 90) % 360; setOpt((o) => ({ ...o, [selItem.id]: { ...o[selItem.id], rotation: nr } })); patchItemM(JSON.stringify({ slug, id: selItem.id, patch: { rotation: nr } })); }}>⟳</button>
               <div style={{ display: "flex", gap: 4, padding: "0 2px" }}>
                 {PALETTE.slice(0, 9).map((c) => (
                   <button key={c} class="fit-swatch" onClick={() => patchItemM(JSON.stringify({ slug, id: selItem.id, patch: { color: c } }))}
@@ -422,8 +511,27 @@ export function App() {
             </div>
           )}
 
-          {calib && <div style={{ position: "absolute", top: 16, left: "50%", transform: "translateX(-50%)", background: T.elevated, border: `1px solid ${T.accent}`, borderRadius: 10, padding: "8px 14px", fontSize: 13, color: T.text, boxShadow: "0 8px 24px -8px rgba(0,0,0,0.8)" }}>{calib.a ? "Click the other end of a known distance" : "Click one end of a known distance on the plan"}</div>}
+          {calib && !(calib.a && calib.b) && <div style={{ position: "absolute", top: 16, left: "50%", transform: "translateX(-50%)", background: T.elevated, border: `1px solid ${T.accent}`, borderRadius: 10, padding: "8px 14px", fontSize: 13, color: T.text, boxShadow: "0 8px 24px -8px rgba(0,0,0,0.8)" }}>{calib.a ? "Now click the other end of that distance" : "Click one end of a known distance on the plan (e.g. a wall)"}</div>}
+          {calib?.a && calib?.b && (
+            <div style={{ position: "absolute", top: 16, left: "50%", transform: "translateX(-50%)", display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", maxWidth: "calc(100vw - 24px)", background: T.elevated, border: `1px solid ${T.accent}`, borderRadius: 12, padding: "10px 14px", boxShadow: "0 12px 32px -10px rgba(0,0,0,0.8)" }}>
+              <span style={{ fontSize: 13, color: T.textSec }}>That line is</span>
+              <input autoFocus value={calibLen} onInput={(e: any) => setCalibLen(e.target.value)} onKeyDown={(e: any) => { if (e.key === "Enter") applyScale(); }} placeholder="10ft"
+                style={{ width: 88, background: T.hover, border: `1px solid ${T.border}`, borderRadius: 8, color: T.text, fontSize: 14, padding: "7px 10px", outline: "none" }} />
+              <button class="fit-btn" style={btn({ background: T.accent, color: "#04201e", border: "none", fontWeight: 600 })} onClick={applyScale}>Set scale</button>
+              <button class="fit-btn" style={btn()} onClick={() => setCalib(null)}>Cancel</button>
+            </div>
+          )}
           {toast && <div style={{ position: "absolute", top: 16, right: 16, maxWidth: "min(320px, calc(100vw - 32px))", background: T.elevated, border: `1px solid ${T.border}`, borderRadius: 10, padding: "8px 14px", fontSize: 13, color: T.text, boxShadow: "0 8px 24px -8px rgba(0,0,0,0.8)" }}>{toast}</div>}
+
+          {/* zoom + grid controls (bottom-left, per-user view settings) */}
+          <div style={{ position: "absolute", bottom: 18, left: 16, display: "flex", gap: 8, alignItems: "center" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 2, background: T.elevated, border: `1px solid ${T.border}`, borderRadius: 10, padding: 3, boxShadow: "0 8px 24px -10px rgba(0,0,0,0.7)" }}>
+              <button class="fit-btn" style={btn({ padding: "4px 11px", background: "transparent", border: "none", fontSize: 18, lineHeight: 1 })} title="Zoom out" onClick={() => setZoom((z) => Math.max(0.4, +(z / 1.2).toFixed(3)))}>−</button>
+              <button class="fit-btn" style={btn({ padding: "4px 6px", background: "transparent", border: "none", fontSize: 12, minWidth: 42 })} title="Reset zoom" onClick={() => setZoom(1)}>{Math.round(zoom * 100)}%</button>
+              <button class="fit-btn" style={btn({ padding: "4px 11px", background: "transparent", border: "none", fontSize: 18, lineHeight: 1 })} title="Zoom in" onClick={() => setZoom((z) => Math.min(3, +(z * 1.2).toFixed(3)))}>+</button>
+            </div>
+            <button class="fit-btn" style={btn(gridOn ? { background: T.accent, color: "#04201e", border: "none", fontWeight: 600 } : {})} title="Toggle 1 ft grid" onClick={() => setGridOn((g) => !g)}>Grid</button>
+          </div>
         </main>
 
         {/* catalog — right rail on desktop, slide-in drawer on mobile */}
